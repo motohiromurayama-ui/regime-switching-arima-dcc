@@ -7,12 +7,12 @@ cells = []
 
 # Title
 cells.append(nbf.v4.new_markdown_cell(r"""
-# レジームスイッチングと多変量正規分布を用いた市場動態のモデリング
+# レジームスイッチングと多変量正規分布を用いた市場動態のモデリング (v2)
 
 このノートブックでは、S&P 500 (SPX) と米国10年国債利回り (DGS10) のデータに対し、**隠れマルコフモデル的なアプローチ（GMMによるレジーム分類＋推移確率行列）**と**レジーム別の多変量正規分布（静的相関）**を組み合わせた分析パイプラインを解説します。
 
 ## 全体のパイプライン概要
-1. **特徴量エンジニアリング**: SPXとDGS10の移動平均、標準偏差、相関係数を計算し、市場の「状態」を捉えやすくする。
+1. **特徴量エンジニアリング**: SPXとDGS10の標準偏差、相関係数を計算し、市場の「状態」を捉えやすくする。（※平均値は使用しません）
 2. **GMMによるクラスタリング**: 特徴量を元に、市場を4つの状態（レジーム）に分類する。
 3. **推移確率行列の計算**: 状態間の遷移確率を経験的に計算する。
 4. **状態ごとのARIMAモデリング（期待値の計算）**: 各状態でARIMAXモデルを推定し、条件付き期待値を算出する。
@@ -24,8 +24,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture
-from statsmodels.tsa.arima.model import ARIMA
+# from statsmodels.tsa.arima.model import ARIMA  # Removed: VARMAX used exclusively
+from statsmodels.tsa.statespace.varmax import VARMAX
 import warnings
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
 warnings.filterwarnings('ignore')
 """))
@@ -36,8 +40,12 @@ cells.append(nbf.v4.new_markdown_cell(r"""
 
 ### 理論
 金融市場は常に同じ法則で動いているわけではなく、「ボラティリティが高い時期」「金利と株価が逆相関になる時期」など、マクロ的な環境（レジーム）が変化します。
-この環境変化を捉えるため、単純な価格だけでなく、「20日（約1ヶ月）の移動平均、標準偏差、および相関」という**ローリング特徴量**を作成します。
-これにより、瞬間的なノイズではなく、一定期間のトレンドやボラティリティの強さを元に状態を分類できるようになります。
+この環境変化を捉えるため、単純な価格の変動だけでなく、「20日（約1ヶ月）の標準偏差、および相関」という**ローリング特徴量**を作成します。
+さらに、市場の方向性（トレンド）を捉えるため、「20日間の変化分」を特徴量として加えます。
+- SPXの20日変化分：20日間の累積リターン（積）
+- DGS10の20日変化分：20日間の変動幅（和）
+
+これにより、瞬間的なノイズではなく、一定期間のボラティリティの強さ、資産間の関係性、そして相場のトレンドを総合的に元に状態を分類できるようになります。
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
@@ -49,11 +57,13 @@ if 'Unnamed: 0' in df.columns:
 
 # ローリング特徴量の作成 (20日 = 約1ヶ月)
 window = 20
-df['sp500_roll_mean'] = df['sp500'].rolling(window=window).mean()
-df['DGS10_roll_mean'] = df['DGS10'].rolling(window=window).mean()
 df['sp500_roll_std'] = df['sp500'].rolling(window=window).std()
 df['DGS10_roll_std'] = df['DGS10'].rolling(window=window).std()
 df['corr'] = df['sp500'].rolling(window=window).corr(df['DGS10'])
+
+# 20日間の変化分（トレンド）の追加
+df['sp500_roll_ret20'] = (1 + df['sp500']).rolling(window=window).apply(np.prod, raw=True) - 1
+df['DGS10_roll_sum20'] = df['DGS10'].rolling(window=window).sum()
 
 # もう一方の変数の過去1日分のデータ（外生変数用）
 df['DGS10_lag1'] = df['DGS10'].shift(1)
@@ -63,15 +73,16 @@ df['sp500_lag1'] = df['sp500'].shift(1)
 df_features = df.dropna().copy()
 print(f"有効なデータ件数: {len(df_features)}件")
 
-features = df_features[['sp500_roll_mean', 'DGS10_roll_mean', 'sp500_roll_std', 'DGS10_roll_std', 'corr']]
+# GMMクラスタリング用の特徴量（5次元）
+features = df_features[['sp500_roll_std', 'DGS10_roll_std', 'corr', 'sp500_roll_ret20', 'DGS10_roll_sum20']]
 """))
 
 # Step 2
 cells.append(nbf.v4.new_markdown_cell(r"""
-## 2. GMMを用いた4つの状態（レジーム）へのクラスタリング
+## 2. GMMを用いたN個の状態（レジーム）へのクラスタリング
 
 ### 理論と計算手法（数式）
-GMM（Gaussian Mixture Model: 混合ガウスモデル）は、データが複数の正規分布の集まり（混合分布）から生成されていると仮定し、それぞれのデータがどの分布から生成されたか（どの状態に属するか）を確率的に推定する手法です。ここでは $K=4$ として市場を4つの異なるレジームに分類しています。
+GMM（Gaussian Mixture Model: 混合ガウスモデル）は、データが複数の正規分布の集まり（混合分布）から生成されていると仮定し、それぞれのデータがどの分布から生成されたか（どの状態に属するか）を確率的に推定する手法です。ここでは変数を設定し、市場を任意の数（`N_REGIMES`）のレジームに分類できるようにしています。
 
 **1. モデルの確率密度関数**
 特徴量ベクトル $x$ が与えられたときの全体の確率分布 $P(x)$ は、各レジームの正規分布の線形結合として表されます。
@@ -87,26 +98,50 @@ EMアルゴリズムが収束した後、各時点 $t$ における市場のレ�
 $$
 S_t = \arg\max_k \gamma(z_{tk})
 $$
-これにより、「平穏な上昇相場」「荒れ相場」などが自動的にグループ化されます。
+これにより、「平穏な相場」「荒れ相場」などが自動的にグループ化されます。
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
-gmm = GaussianMixture(n_components=4, random_state=42, n_init=10)
+# レジームの数を指定（ここを変更するだけで全体に反映されます）
+N_REGIMES = 14
+
+gmm = GaussianMixture(n_components=N_REGIMES, random_state=42, n_init=10)
 df_features['Regime'] = gmm.fit_predict(features)
 
 print("各レジームのデータ件数:")
 print(df_features['Regime'].value_counts().sort_index())
 
-# 状態の可視化
-plt.figure(figsize=(15, 6))
-plt.plot(df_features.index, df_features['sp500'], color='black', alpha=0.3, label='S&P 500 Return')
-colors = ['red', 'blue', 'green', 'orange']
-for i in range(4):
+# 状態の可視化 (Plotly)
+fig = go.Figure()
+
+# S&P 500 Return
+fig.add_trace(go.Scatter(
+    x=df_features.index, y=df_features['sp500'],
+    mode='lines',
+    line=dict(color='black', width=1),
+    opacity=0.3,
+    name='S&P 500 Return'
+))
+
+# 各レジームの散布図
+colors = px.colors.qualitative.Plotly
+for i in range(N_REGIMES):
     mask = df_features['Regime'] == i
-    plt.scatter(df_features.index[mask], df_features['sp500'][mask], color=colors[i], label=f'Regime {i}', s=10)
-plt.title('S&P 500 Returns by GMM Clustered Regime')
-plt.legend()
-plt.show()
+    fig.add_trace(go.Scatter(
+        x=df_features.index[mask], y=df_features['sp500'][mask],
+        mode='markers',
+        marker=dict(color=colors[i % len(colors)], size=4),
+        name=f'Regime {i}'
+    ))
+
+fig.update_layout(
+    title=f'S&P 500 Returns by GMM Clustered Regime (N={N_REGIMES})',
+    xaxis_title='Date',
+    yaxis_title='Return',
+    height=500,
+    legend_title='Legend (Click to toggle)'
+)
+fig.show()
 """))
 
 # Step 3
@@ -120,7 +155,7 @@ cells.append(nbf.v4.new_markdown_cell(r"""
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
-transition_matrix = np.zeros((4, 4))
+transition_matrix = np.zeros((N_REGIMES, N_REGIMES))
 regimes = df_features['Regime'].values
 for t in range(1, len(regimes)):
     from_state = regimes[t-1]
@@ -131,58 +166,71 @@ for t in range(1, len(regimes)):
 transition_matrix = transition_matrix / transition_matrix.sum(axis=1, keepdims=True)
 
 print("【推移確率行列 (Transition Matrix)】")
-for i in range(4):
-    print(f"状態 {i} からの遷移確率: [0]:{transition_matrix[i,0]:.3f}, [1]:{transition_matrix[i,1]:.3f}, [2]:{transition_matrix[i,2]:.3f}, [3]:{transition_matrix[i,3]:.3f}")
+for i in range(N_REGIMES):
+    probs_str = ", ".join([f"[{j}]:{transition_matrix[i,j]:.3f}" for j in range(N_REGIMES)])
+    print(f"状態 {i} からの遷移確率: {probs_str}")
 """))
 
 # Step 4
 cells.append(nbf.v4.new_markdown_cell(r"""
-## 4. 状態ごとのARIMAモデリング（期待値の計算）
+## 4. 状態ごとのVARMAXモデリング（期待値の計算）
 
-### 理論
-時系列データが全体を通して同じ法則に従う（定常的である）と仮定すると、構造変化を見落としてしまいます。そこで、レジームごとに別々のARIMAモデルを推定します。
-* **ARIMA (2,1,1)**: 階差(d=1)を取りつつ、過去2日分の自己回帰(AR=2)と過去1日分の移動平均(MA=1)を考慮するモデル。
-* **exog (外生変数)**: SPXのモデルにはDGS10の過去1日分のデータを、DGS10のモデルにはSPXの過去1日分のデータを組み込む（ARIMAX）。
+### 内部でのカルマンフィルタ（状態空間モデル）の役割と数式表現
 
-ここでは、シミュレーションのベースラインとなる「条件付き期待値（予測値）」を計算し、全期間の「予測誤差（残差）」を繋ぎ合わせます。
+本コードで使用している `statsmodels` の `VARMAX` クラスは、内部的にモデルを**線形状態空間モデル（Linear State-Space Model）**として定式化し、**カルマンフィルタ（Kalman Filter）**を用いて最尤推定および期待値の算出を行っています。
+# ARIMA modeling removed; VARMAX handles predictions for both series
+
+（$\phi$ はAR係数、$\theta$ はMA係数）
+
+**カルマンフィルタによる予測と更新のアルゴリズム**
+与えられたデータから尤度を計算し、最適な予測を得るために、以下の漸化式を各時点 $t$ で反復します。
+* **予測ステップ (Prediction)**:
+  * 状態の事前推定: $a_{t|t-1} = T a_{t-1|t-1}$
+  * 誤差共分散の事前推定: $P_{t|t-1} = T P_{t-1|t-1} T^\top + R Q R^\top$
+* **更新ステップ (Update)**:
+  * 観測の予測誤差 (イノベーション): $v_t = y_t - Z a_{t|t-1} - x_t^\top \beta$
+  * 予測誤差の分散: $F_t = Z P_{t|t-1} Z^\top + H$
+  * カルマンゲイン (修正の重み): $K_t = P_{t|t-1} Z^\top F_t^{-1}$
+  * 状態の事後推定: $a_{t|t} = a_{t|t-1} + K_t v_t$
+  * 誤差共分散の事後推定: $P_{t|t} = P_{t|t-1} - K_t Z P_{t|t-1}$
+
+**欠損データ（非連続なレジーム）に対するカルマンフィルタの挙動**
+本分析ではレジームごとにデータを分割しているため、対象外のレジームの期間は `NaN`（欠損値）となります。カルマンフィルタはこのようなトビトビのデータに対して以下のように振る舞います。
+* **データが欠損している時点 $t$**:
+  観測値 $y_t$ が存在しないため、更新ステップ（Update）はスキップされます（事実上カルマンゲイン $K_t = 0$）。
+  しかし、予測ステップ（Prediction）は継続して行われるため、事後推定値は更新されず（$a_{t|t} = a_{t|t-1}$）、次の時点への予測状態は以下のように前進し続けます。
+  $$ a_{t+1|t} = T a_{t|t} = T a_{t|t-1} $$
+  $$ P_{t+1|t} = T P_{t|t} T^\top + R Q R^\top = T P_{t|t-1} T^\top + R Q R^\top $$
+  これにより、カレンダー通りの正しい時間関係（ラグ）を維持したまま、見えない期間の内部状態（ARMAプロセスの見えないノイズ）を推定し続けることができます。
+
+`model.fit()` は、このカルマンフィルタから得られる予測誤差 $v_t$ とその分散 $F_t$ を用いて対数尤度を計算し、尤度が最大になるようにパラメータ（$\phi, \theta, \beta$ 等）を最適化しています。
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
 # モデルの保存用辞書
-models_sp500 = {}
-models_dgs = {}
+
+
+models_varmax = {}
 df_features['sp500_pred'] = np.nan
 df_features['DGS10_pred'] = np.nan
 
-for i in range(4):
+for i in range(N_REGIMES):
     print(f"\\n--- レジーム {i} のモデルフィッティング ---")
     mask = df_features['Regime'] == i
     
-    # 1. SPX の ARIMA モデル (exog=DGS10_lag1)
-    y_sp500 = df_features['sp500'].copy()
-    y_sp500[~mask] = np.nan
-    exog_dgs = df_features['DGS10_lag1']
-    
+    # VARMAX モデル (exog: DGS10_lag1, sp500_lag1) with order (p=2, q=1)
+    # Endogenous variables: sp500 and DGS10
+    endog = df_features[['sp500', 'DGS10']].copy()
+    endog[~mask] = np.nan
+    exog = df_features[['DGS10_lag1', 'sp500_lag1']]
     try:
-        model_sp500 = ARIMA(endog=y_sp500, exog=exog_dgs, order=(2, 1, 1))
-        res_sp500 = model_sp500.fit()
-        models_sp500[i] = res_sp500
-        df_features.loc[mask, 'sp500_pred'] = res_sp500.predict()[mask]
-        print(f"【SPX 推定パラメータ】\\n{res_sp500.params}")
-    except Exception as e:
-        print(e)
-
-    # 2. DGS10 の ARIMA モデル (exog=sp500_lag1)
-    y_dgs = df_features['DGS10'].copy()
-    y_dgs[~mask] = np.nan
-    exog_sp500 = df_features['sp500_lag1']
-    
-    try:
-        model_dgs = ARIMA(endog=y_dgs, exog=exog_sp500, order=(2, 1, 1))
-        res_dgs = model_dgs.fit()
-        models_dgs[i] = res_dgs
-        df_features.loc[mask, 'DGS10_pred'] = res_dgs.predict()[mask]
-        print(f"\\n【DGS10 推定パラメータ】\\n{res_dgs.params}")
+        model = VARMAX(endog=endog, exog=exog, order=(2, 1))
+        res = model.fit(disp=False)
+        models_varmax[i] = res
+        preds = res.predict()
+        df_features.loc[mask, 'sp500_pred'] = preds.loc[mask, 'sp500']
+        df_features.loc[mask, 'DGS10_pred'] = preds.loc[mask, 'DGS10']
+        print(f"【VARMAX 推定パラメータ】\\n{res.params}")
     except Exception as e:
         print(e)
 
@@ -195,45 +243,55 @@ df_features['resid_dgs'].fillna(0, inplace=True)
 
 cells.append(nbf.v4.new_markdown_cell(r"""
 ### レジームごとの予測誤差（残差）の分布比較
-各レジームにおけるARIMAモデルの予測誤差（実際の値 - 予測値）の分布を、ヒストグラムをベースにした折れ線グラフ（度数多角形）で一括比較します。
-全体に対する割合（密度）で描画しているため、データ件数が異なるレジーム間でも、予測のばらつき（ボラティリティ）の形状を直接比較できます。
+各レジームにおけるARIMAモデルの予測誤差（実際の値 - 予測値）の分布を、**度数分布多角形（Frequency Polygon）**で比較します。
+横軸に予測誤差、縦軸に密度（Density）を配置することで、レジームのばらつき（ボラティリティの大きさ）や分布の偏りを、凡例のクリックで直感的に表示・非表示を切り替えながら比較できます。
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-colors = ['red', 'blue', 'green', 'orange']
+# レジームごとの分布可視化 (Plotly)
+fig = make_subplots(rows=1, cols=2, subplot_titles=("SPX Prediction Error Distribution", "DGS10 Prediction Error Distribution"))
+colors = px.colors.qualitative.Plotly
 
-for i in range(4):
+# ビンの幅を全体で統一して計算
+spx_min, spx_max = df_features['resid_sp500'].min(), df_features['resid_sp500'].max()
+dgs_min, dgs_max = df_features['resid_dgs'].min(), df_features['resid_dgs'].max()
+spx_bins = np.linspace(spx_min, spx_max, 50)
+dgs_bins = np.linspace(dgs_min, dgs_max, 50)
+spx_bin_centers = (spx_bins[:-1] + spx_bins[1:]) / 2
+dgs_bin_centers = (dgs_bins[:-1] + dgs_bins[1:]) / 2
+
+for i in range(N_REGIMES):
     mask = df_features['Regime'] == i
-    res_sp = df_features.loc[mask, 'resid_sp500'].dropna().values
-    res_dgs = df_features.loc[mask, 'resid_dgs'].dropna().values
+    data_spx = df_features.loc[mask, 'resid_sp500'].dropna()
+    data_dgs = df_features.loc[mask, 'resid_dgs'].dropna()
     
-    if len(res_sp) > 1:
-        # SPXのヒストグラムの階級値（ビンの中央）と割合を計算して折れ線グラフを描画
-        counts_sp, bins_sp = np.histogram(res_sp, bins=30, density=True)
-        bin_centers_sp = 0.5 * (bins_sp[1:] + bins_sp[:-1])
-        axes[0].plot(bin_centers_sp, counts_sp, marker='o', markersize=4, color=colors[i], label=f'Regime {i}', linewidth=1.5, alpha=0.8)
-        
-    if len(res_dgs) > 1:
-        # DGS10のヒストグラムの階級値と割合を計算して折れ線グラフを描画
-        counts_dgs, bins_dgs = np.histogram(res_dgs, bins=30, density=True)
-        bin_centers_dgs = 0.5 * (bins_dgs[1:] + bins_dgs[:-1])
-        axes[1].plot(bin_centers_dgs, counts_dgs, marker='o', markersize=4, color=colors[i], label=f'Regime {i}', linewidth=1.5, alpha=0.8)
+    # SPX Frequency Polygon
+    if len(data_spx) > 1:
+        hist_spx, _ = np.histogram(data_spx, bins=spx_bins, density=True)
+        fig.add_trace(go.Scatter(
+            x=spx_bin_centers, y=hist_spx, mode='lines',
+            name=f'Regime {i}', line=dict(color=colors[i % len(colors)], width=2),
+            legendgroup=f'Regime {i}', showlegend=True
+        ), row=1, col=1)
+    
+    # DGS10 Frequency Polygon
+    if len(data_dgs) > 1:
+        hist_dgs, _ = np.histogram(data_dgs, bins=dgs_bins, density=True)
+        fig.add_trace(go.Scatter(
+            x=dgs_bin_centers, y=hist_dgs, mode='lines',
+            name=f'Regime {i}', line=dict(color=colors[i % len(colors)], width=2),
+            legendgroup=f'Regime {i}', showlegend=False
+        ), row=1, col=2)
 
-axes[0].set_title('SPX Prediction Error Distribution (Proportion Line Graph)')
-axes[0].set_xlabel('Prediction Error (Actual - Predicted)')
-axes[0].set_ylabel('Proportion (Density)')
-axes[0].legend()
-axes[0].grid(True, alpha=0.3)
-
-axes[1].set_title('DGS10 Prediction Error Distribution (Proportion Line Graph)')
-axes[1].set_xlabel('Prediction Error (Actual - Predicted)')
-axes[1].set_ylabel('Proportion (Density)')
-axes[1].legend()
-axes[1].grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
+fig.update_layout(
+    height=500,
+    legend_title='Legend (Click to toggle)'
+)
+fig.update_xaxes(title_text="Prediction Error", row=1, col=1)
+fig.update_yaxes(title_text="Density", row=1, col=1)
+fig.update_xaxes(title_text="Prediction Error", row=1, col=2)
+fig.update_yaxes(title_text="Density", row=1, col=2)
+fig.show()
 """))
 
 cells.append(nbf.v4.new_markdown_cell(r"""
@@ -241,7 +299,7 @@ cells.append(nbf.v4.new_markdown_cell(r"""
 
 ### 理論: レジームごとの多変量正規分布によるシミュレーション
 
-極端な動的相関（過剰なクラスタリング）を防ぐため、レジームごとに「予測誤差の分散共分散行列（固定相関）」を計算し、各時点での現在のレジームに対応する多変量正規分布からショックをサンプリングします。
+レジームごとに「予測誤差の分散共分散行列（固定相関）」を計算し、各時点での現在のレジームに対応する多変量正規分布からショックをサンプリングします。
 
 $$
 \begin{pmatrix} y_{sp, t} \\ y_{dgs, t} \end{pmatrix}_{sim} = \begin{pmatrix} \hat{y}_{sp, t} \\ \hat{y}_{dgs, t} \end{pmatrix} + \epsilon_t
@@ -256,7 +314,7 @@ cells.append(nbf.v4.new_code_cell("""\
 # レジームごとの共分散行列を計算
 regime_cov_matrices = {}
 
-for i in range(4):
+for i in range(N_REGIMES):
     mask = df_features['Regime'] == i
     res_sp = df_features.loc[mask, 'resid_sp500'].values
     res_dgs = df_features.loc[mask, 'resid_dgs'].values
@@ -323,8 +381,8 @@ plt.show()
 cells.append(nbf.v4.new_markdown_cell(r"""
 ## 6. 全期間での累積リターンの比較
 
-初期値を $1$ として、実際のSPXリターンとモデルの予測リターン（`sp500_pred`）を累積（複利計算）して比較します。
-これにより、モデルの予測通りに運用した場合の長期的なパフォーマンスと、実際の市場のパフォーマンスの乖離を視覚的に評価できます。
+初期値を $1$ として、実際のSPXリターンと、期待値のみを用いた予測リターン、ランダムショックを加えたシミュレーションリターンを累積（複利計算）して比較します。
+※モデルが出力する期待値（`sp500_pred`）はボラティリティを持たないため、複利計算の仕様上（ボラティリティ・ドラッグの欠如により）非現実的な軌道を描いてしまう傾向がありますが、参考として表示しています。
 """))
 
 cells.append(nbf.v4.new_code_cell("""\
@@ -335,7 +393,7 @@ df_features['cum_sp500_sim'] = (1 + df_features['sp500_simulated'].fillna(0)).cu
 
 plt.figure(figsize=(15, 6))
 plt.plot(df_features.index, df_features['cum_sp500'], label='Actual SPX Cumulative Return', color='black')
-plt.plot(df_features.index, df_features['cum_sp500_pred'], label='Predicted SPX Cumulative Return', color='blue', linestyle='--')
+plt.plot(df_features.index, df_features['cum_sp500_pred'], label='Predicted SPX Cumulative Return (Mean)', color='blue', linestyle='--')
 plt.plot(df_features.index, df_features['cum_sp500_sim'], label='Simulated SPX Cumulative Return', color='red', alpha=0.7)
 plt.title('Cumulative Returns: Actual vs Predicted vs Simulated (Initial Value = 1)')
 plt.xlabel('Date')
@@ -403,5 +461,5 @@ plt.show()
 """))
 
 nb['cells'] = cells
-with open('/home/u00118/Analysing_Models(sonomamadata)/Marcov_Switching_Model/Regime_Switching_ARIMA_Theory_and_Code.ipynb', 'w', encoding='utf-8') as f:
+with open('/home/u00118/Analysing_Models(sonomamadata)/Marcov_Switching_Model/Regime_Switching_ARIMA_Theory_and_Code_v2.ipynb', 'w', encoding='utf-8') as f:
     nbf.write(nb, f)

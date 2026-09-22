@@ -14,6 +14,8 @@ if repo_path not in sys.path:
 try:
     from DCC_GARCH.DCC.DCC import DCC
     from DCC_GARCH.DCC.DCC_loss import dcc_loss_gen, R_gen
+    from DCC_GARCH.GARCH.GARCH import GARCH
+    from DCC_GARCH.GARCH.GARCH_loss import garch_loss_gen
 except ImportError as e:
     print("DCC-GARCH repository import failed:", e)
 
@@ -88,20 +90,18 @@ def main():
         print(f"状態 {i} からの遷移確率: [0]:{transition_matrix[i,0]:.3f}, [1]:{transition_matrix[i,1]:.3f}, [2]:{transition_matrix[i,2]:.3f}, [3]:{transition_matrix[i,3]:.3f}")
 
     print("\n==================================================")
-    print(" 4. 状態ごとのARIMAモデリング")
+    print(" 4. 状態ごとのARIMAモデリング（期待値の計算）")
     print("==================================================")
     # 予測値を格納するカラムを準備
     df_features['sp500_pred'] = np.nan
     df_features['DGS10_pred'] = np.nan
-    df_features['sp500_simulated'] = np.nan
-    df_features['DGS10_simulated'] = np.nan
 
     # ARIMAのフィッティング
     for i in range(4):
-        print(f"\n--- レジーム {i} のモデルフィッティング中 ---")
+        print(f"\n--- レジーム {i} のARIMAモデリング中 ---")
         mask = df_features['Regime'] == i
         
-        # --- SPX の ARIMA モデル (exog=DGS10_lag1) ---
+        # --- SPX の ARIMA モデル ---
         y_sp500 = df_features['sp500'].copy()
         y_sp500[~mask] = np.nan
         exog_dgs = df_features['DGS10_lag1']
@@ -109,18 +109,12 @@ def main():
         try:
             model_sp500 = ARIMA(endog=y_sp500, exog=exog_dgs, order=(2, 1, 1))
             res_sp500 = model_sp500.fit()
-            print(f"【レジーム {i}: SPX推定パラメータ】")
-            print(res_sp500.params)
-            
-            # 予測値（フィッティング値＝条件付き期待値）を保存
             pred_mean_sp = res_sp500.predict()[mask]
             df_features.loc[mask, 'sp500_pred'] = pred_mean_sp
-            sigma2_sp = res_sp500.params.get('sigma2', 0)
-
         except Exception as e:
-            print(f"レジーム {i} のSPXモデリング中にエラーが発生しました: {e}")
+            print(f"レジーム {i} のSPXモデリング中にエラー: {e}")
 
-        # --- DGS10 の ARIMA モデル (exog=sp500_lag1) ---
+        # --- DGS10 の ARIMA モデル ---
         y_dgs = df_features['DGS10'].copy()
         y_dgs[~mask] = np.nan
         exog_sp500 = df_features['sp500_lag1']
@@ -128,71 +122,148 @@ def main():
         try:
             model_dgs = ARIMA(endog=y_dgs, exog=exog_sp500, order=(2, 1, 1))
             res_dgs = model_dgs.fit()
-            print(f"【レジーム {i}: DGS推定パラメータ】")
-            print(res_dgs.params)
-            
-            # 予測値（フィッティング値＝条件付き期待値）を保存
             pred_mean_dgs = res_dgs.predict()[mask]
             df_features.loc[mask, 'DGS10_pred'] = pred_mean_dgs
-            sigma2_dgs = res_dgs.params.get('sigma2', 1e-6)
-            
-            # --- DCC-GARCH モデルのフィッティング ---
-            print(f"【レジーム {i}: DCC-GARCH モデルフィッティング】")
-            resid_sp = res_sp500.resid[mask]
-            resid_dgs = res_dgs.resid[mask]
-            
-            sigma2_sp = res_sp500.params.get('sigma2', 1e-6)
-            
-            # 標準化残差
-            e_sp = resid_sp / np.sqrt(sigma2_sp)
-            e_dgs = resid_dgs / np.sqrt(sigma2_dgs)
-            
-            # [e_T, ..., e_0] にするため逆順
-            tr = np.array([e_sp[::-1], e_dgs[::-1]])
-            
-            dcc_model = DCC(max_itr=3)
-            dcc_model.set_loss(dcc_loss_gen())
-            dcc_model.fit(tr)
-            ab = dcc_model.get_ab()
-            print(f"最適化された DCC パラメータ (a, b) = {ab}")
-            
-            # 動的相関行列の生成
-            R_list = R_gen(tr, ab)
-            R_list_chrono = R_list[::-1]
-            
-            std_sp = np.sqrt(sigma2_sp)
-            std_dgs = np.sqrt(sigma2_dgs)
-            
-            shocks_sp = np.zeros(mask.sum())
-            shocks_dgs = np.zeros(mask.sum())
-            
-            for t in range(mask.sum()):
-                R_t = R_list_chrono[t]
-                rho_t = R_t[0, 1]
-                cov_t = rho_t * std_sp * std_dgs
-                cov_matrix_t = [[sigma2_sp, cov_t], [cov_t, sigma2_dgs]]
-                
-                # シードは固定しないか、必要に応じて固定（ここではランダムに）
-                shock_t = np.random.multivariate_normal([0, 0], cov_matrix_t)
-                shocks_sp[t] = shock_t[0]
-                shocks_dgs[t] = shock_t[1]
-            
-            df_features.loc[mask, 'sp500_simulated'] = pred_mean_sp + shocks_sp
-            df_features.loc[mask, 'DGS10_simulated'] = pred_mean_dgs + shocks_dgs
-
         except Exception as e:
-            print(f"レジーム {i} のDGSまたはDCCモデリング中にエラーが発生しました: {e}")
+            print(f"レジーム {i} のDGSモデリング中にエラー: {e}")
+
+    # 残差（予測誤差）を全期間連続データとして計算
+    df_features['resid_sp500'] = df_features['sp500'] - df_features['sp500_pred']
+    df_features['resid_dgs'] = df_features['DGS10'] - df_features['DGS10_pred']
+    
+    # 稀にNaNが含まれる場合は0埋め（通常はない）
+    df_features['resid_sp500'].fillna(0, inplace=True)
+    df_features['resid_dgs'].fillna(0, inplace=True)
 
     print("\n==================================================")
-    print(" 5. モデルによる出力（実際の値と予測値・シミュレーション値の比較）")
+    print(" 5. 全期間を通した GARCH および DCC-GARCH モデリング")
     print("==================================================")
     
-    # 最後の出力をする際に、小数点以下6桁に丸める
+    resid_sp = df_features['resid_sp500'].values
+    resid_dgs = df_features['resid_dgs'].values
+    
+    # リポジトリの仕様 [r_T, ..., r_0] の順にするため逆順にする。
+    # GARCHの最適化（COBYLA等）が収束しやすいように、スケールを100倍（%表記）にする
+    r_sp_rev = resid_sp[::-1] * 100.0
+    r_dgs_rev = resid_dgs[::-1] * 100.0
+
+    print("【SPX: GARCH(1,1) モデルフィッティング】")
+    garch_sp = GARCH(p=1, q=1, max_itr=3)
+    garch_sp.set_loss(garch_loss_gen(p=1, q=1))
+    garch_sp.fit(r_sp_rev)
+    # sigma() は [s_T, ..., s_0] を返すので逆順にして [s_0, ..., s_T] に戻す
+    sigma_sp = garch_sp.sigma(r_sp_rev)[::-1]
+    
+    print("【DGS10: GARCH(1,1) モデルフィッティング】")
+    garch_dgs = GARCH(p=1, q=1, max_itr=3)
+    garch_dgs.set_loss(garch_loss_gen(1, 1))
+    garch_dgs.fit(r_dgs_rev)
+    sigma_dgs = garch_dgs.sigma(r_dgs_rev)[::-1]
+    
+    # 標準化残差 (スケールを合わせたまま割り算)
+    e_sp = (resid_sp * 100.0) / sigma_sp
+    e_dgs = (resid_dgs * 100.0) / sigma_dgs
+    
+    # DCCフィッティング用データ [e_T, ..., e_0]
+    tr = np.array([e_sp[::-1], e_dgs[::-1]])
+    
+    # FHS用: 各レジームごとの標準化残差プール作成
+    regime_noise_pools = {}
+    for i in range(4):
+        mask = df_features['Regime'] == i
+        regime_noise_pools[i] = np.array([e_sp[mask], e_dgs[mask]]).T
+    
+    print("【DCC-GARCH モデルフィッティング】")
+    dcc_model = DCC(max_itr=3)
+    dcc_model.set_loss(dcc_loss_gen())
+    dcc_model.fit(tr)
+    ab = dcc_model.get_ab()
+    print(f"最適化された DCC パラメータ (a, b) = {ab}")
+    
+    # シミュレーションの実行
+    print("--- 動的分散と動的相関を用いたレジーム依存・再帰的シミュレーションの実行 (FHS) ---")
+    df_features['sp500_simulated'] = np.nan
+    df_features['DGS10_simulated'] = np.nan
+    shocks_sp = np.zeros(len(df_features))
+    shocks_dgs = np.zeros(len(df_features))
+    
+    # 再帰的シミュレーションのための初期化
+    theta_sp = garch_sp.get_theta()
+    theta_dgs = garch_dgs.get_theta()
+    
+    s_sp_t = sigma_sp[0]
+    s_dgs_t = sigma_dgs[0]
+    
+    ab_dcc = dcc_model.get_ab()
+    a_dcc, b_dcc = ab_dcc[0], ab_dcc[1]
+    Q_bar = Q_average(tr)
+    Q_t = Q_bar.copy()
+    
+    for t in range(len(df_features)):
+        # 1. 今日の相関 (rho_t) の計算
+        temp = 1.0 / np.sqrt(np.abs(Q_t))
+        temp = temp * np.eye(2)
+        R_t = np.dot(np.dot(temp, Q_t), temp)
+        rho_t = R_t[0, 1]
+        
+        if rho_t**2 >= 1.0:
+            rho_t = np.sign(rho_t) * 0.999
+        
+        # GARCHで100倍したスケールを元に戻す
+        sigma_sp_orig = s_sp_t / 100.0
+        sigma_dgs_orig = s_dgs_t / 100.0
+        
+        # シミュレーション時点のレジーム
+        sim_regime = df_features['Regime'].iloc[t]
+        
+        # レジームプールからランダムに過去の独立ノイズ(z_tau)を1つ引く
+        pool = regime_noise_pools[sim_regime]
+        z_idx = np.random.randint(len(pool))
+        z_sim = pool[z_idx]
+        
+        # シミュレーション時点の相関(L_t)を掛けて再相関化
+        L_t = np.array([
+            [1.0, 0.0],
+            [rho_t, np.sqrt(max(1.0 - rho_t**2, 1e-6))]
+        ])
+        e_sim = L_t @ z_sim
+        
+        # シミュレーション時点のGARCHボラティリティを掛ける
+        shocks_sp[t] = e_sim[0] * sigma_sp_orig
+        shocks_dgs[t] = e_sim[1] * sigma_dgs_orig
+        
+        # ----------------------------------------------------
+        # 明日のための再帰的アップデート (Recursive Update)
+        # ----------------------------------------------------
+        # GARCHの更新 (100倍スケールのショックを利用)
+        r_sp_t_scaled = shocks_sp[t] * 100.0
+        r_dgs_t_scaled = shocks_dgs[t] * 100.0
+        
+        var_sp = s_sp_t ** 2
+        r_sq_sp = r_sp_t_scaled ** 2
+        gjr_sp = r_sq_sp * (r_sp_t_scaled < 0)
+        s_sp_t = np.sqrt(np.abs(theta_sp[0] + theta_sp[1]*r_sq_sp + theta_sp[2]*gjr_sp + theta_sp[3]*var_sp))
+        
+        var_dgs = s_dgs_t ** 2
+        r_sq_dgs = r_dgs_t_scaled ** 2
+        gjr_dgs = r_sq_dgs * (r_dgs_t_scaled < 0)
+        s_dgs_t = np.sqrt(np.abs(theta_dgs[0] + theta_dgs[1]*r_sq_dgs + theta_dgs[2]*gjr_dgs + theta_dgs[3]*var_dgs))
+        
+        # DCCの更新
+        Q_t = (1.0 - a_dcc - b_dcc) * Q_bar + a_dcc * np.outer(e_sim, e_sim) + b_dcc * Q_t
+        
+    df_features['sp500_simulated'] = df_features['sp500_pred'] + shocks_sp
+    df_features['DGS10_simulated'] = df_features['DGS10_pred'] + shocks_dgs
+
+    print("\n==================================================")
+    print(" 6. モデルによる出力（実際の値と予測値・シミュレーション値の比較）")
+    print("==================================================")
+    
     round_cols = ['sp500_pred', 'sp500_simulated', 'DGS10_pred', 'DGS10_simulated']
     df_features[round_cols] = df_features[round_cols].round(6)
     
     output_df = df_features[['Regime', 'sp500', 'sp500_pred', 'sp500_simulated', 'DGS10', 'DGS10_pred', 'DGS10_simulated']]
-    print("【直近10日間のデータ（実際の値・予測値・シミュレーション値）】")
+    print("【直近10日間のデータ】")
     print(output_df.tail(10))
     
     output_path = '/home/u00118/Analysing_Models(sonomamadata)/Marcov_Switching_Model/predictions_output.csv'
@@ -200,9 +271,8 @@ def main():
     print(f"\n-> 予測結果全体をCSVに保存しました: {output_path}")
 
     print("\n==================================================")
-    print(" 6. 全期間での累積リターンの比較プロット生成")
+    print(" 7. 全期間での累積リターンの比較プロット生成")
     print("==================================================")
-    # 累積リターンの計算
     df_features['cum_sp500'] = (1 + df_features['sp500'].fillna(0)).cumprod()
     df_features['cum_sp500_pred'] = (1 + df_features['sp500_pred'].fillna(0)).cumprod()
     df_features['cum_sp500_sim'] = (1 + df_features['sp500_simulated'].fillna(0)).cumprod()
@@ -223,7 +293,7 @@ def main():
     print(f"-> 累積リターンのプロットを保存しました: {cum_plot_path}")
 
     print("\n==================================================")
-    print(" 7. 実データとモデル生成データの相関比較 (1-Year Rolling)")
+    print(" 8. 実データとモデル生成データの相関比較 (1-Year Rolling)")
     print("==================================================")
     df_features['1Y_Label'] = df_features.index.year.astype(str)
     
